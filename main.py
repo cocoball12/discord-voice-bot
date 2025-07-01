@@ -100,8 +100,14 @@ class VoiceChannelView(discord.ui.View):
             if not category:
                 category = await guild.create_category("🔊 임시 통화방")
             
-            # 채널 이름 생성 (생성자 이름 없이)
-            channel_name = f"{limit}인방"
+            # 채널 이름 생성 (생성자 이름과 시간 포함)
+            import random
+            channel_name = f"{user.display_name}의 {limit}인방"
+            
+            # 동일한 이름의 채널이 있는지 확인하고 번호 추가
+            existing_channels = [ch for ch in guild.voice_channels if ch.name.startswith(channel_name)]
+            if existing_channels:
+                channel_name = f"{channel_name} #{len(existing_channels) + 1}"
             
             # 음성 채널 생성
             voice_channel = await guild.create_voice_channel(
@@ -138,7 +144,8 @@ class VoiceChannelView(discord.ui.View):
                 title="🎉 통화방 생성 완료!",
                 description=f"**{channel_name}** 이 생성되었습니다.\n"
                            f"📊 최대 인원: **{limit}명**\n"
-                           f"⏰ 30초간 비어있으면 자동 삭제됩니다.",
+                           f"⏰ 30초간 비어있으면 자동 삭제됩니다.\n"
+                           f"🔗 채널: <#{voice_channel.id}>",
                 color=0x00ff88
             )
             
