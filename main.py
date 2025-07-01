@@ -34,6 +34,38 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 created_channels = {}
 channel_timers = {}
 
+async def delete_channel_after_delay(channel_id, delay=30):
+    """지정된 시간 후 채널 삭제"""
+    await asyncio.sleep(delay)
+    
+    if channel_id in created_channels:
+        try:
+            channel = created_channels[channel_id]['channel']
+            
+            # 채널이 여전히 비어있는지 확인
+            if len(channel.members) == 0:
+                await channel.delete()
+                print(f"30초 타이머로 채널 삭제됨: {channel.name}")
+                
+                # 딕셔너리에서 제거
+                if channel_id in created_channels:
+                    del created_channels[channel_id]
+                if channel_id in channel_timers:
+                    del channel_timers[channel_id]
+            else:
+                # 채널에 사람이 있으면 타이머 제거
+                if channel_id in channel_timers:
+                    del channel_timers[channel_id]
+                    
+        except discord.NotFound:
+            # 채널이 이미 삭제된 경우
+            if channel_id in created_channels:
+                del created_channels[channel_id]
+            if channel_id in channel_timers:
+                del channel_timers[channel_id]
+        except Exception as e:
+            print(f"타이머 채널 삭제 오류: {e}")
+
 class VoiceChannelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -97,12 +129,16 @@ class VoiceChannelView(discord.ui.View):
                     created_channels[voice_channel.id]['has_been_used'] = True
                 except:
                     pass
+            else:
+                # 사용자가 음성 채널에 없으면 30초 타이머 시작
+                task = asyncio.create_task(delete_channel_after_delay(voice_channel.id))
+                channel_timers[voice_channel.id] = task
             
             embed = discord.Embed(
                 title="🎉 통화방 생성 완료!",
                 description=f"**{channel_name}** 이 생성되었습니다.\n"
                            f"📊 최대 인원: **{limit}명**\n"
-                           f"⏰ 사용 후 비어있으면 자동 삭제됩니다.",
+                           f"⏰ 30초간 비어있으면 자동 삭제됩니다.",
                 color=0x00ff88
             )
             
@@ -135,31 +171,45 @@ async def on_voice_state_update(member, before, after):
     # 사용자가 임시 통화방에 들어왔을 때
     if after.channel and after.channel.id in created_channels:
         created_channels[after.channel.id]['has_been_used'] = True
+        
+        # 기존 타이머가 있으면 취소
         if after.channel.id in channel_timers:
             channel_timers[after.channel.id].cancel()
             del channel_timers[after.channel.id]
+            print(f"채널 입장으로 타이머 취소됨: {after.channel.name}")
     
     # 사용자가 임시 통화방을 떠났을 때
     if before.channel and before.channel.id in created_channels:
-        if len(before.channel.members) == 0 and created_channels[before.channel.id]['has_been_used']:
-            try:
-                await before.channel.delete()
-                
-                if before.channel.id in created_channels:
-                    del created_channels[before.channel.id]
-                if before.channel.id in channel_timers:
-                    channel_timers[before.channel.id].cancel()
-                    del channel_timers[before.channel.id]
-                
-                print(f"사용 후 빈 채널 삭제됨: {before.channel.name}")
-                
-            except discord.NotFound:
-                if before.channel.id in created_channels:
-                    del created_channels[before.channel.id]
-                if before.channel.id in channel_timers:
-                    del channel_timers[before.channel.id]
-            except Exception as e:
-                print(f"채널 삭제 오류: {e}")
+        channel_info = created_channels[before.channel.id]
+        
+        # 채널이 완전히 비었는지 확인
+        if len(before.channel.members) == 0:
+            if channel_info['has_been_used']:
+                # 사용된 적이 있는 채널은 즉시 삭제
+                try:
+                    await before.channel.delete()
+                    
+                    if before.channel.id in created_channels:
+                        del created_channels[before.channel.id]
+                    if before.channel.id in channel_timers:
+                        channel_timers[before.channel.id].cancel()
+                        del channel_timers[before.channel.id]
+                    
+                    print(f"사용 후 빈 채널 즉시 삭제됨: {before.channel.name}")
+                    
+                except discord.NotFound:
+                    if before.channel.id in created_channels:
+                        del created_channels[before.channel.id]
+                    if before.channel.id in channel_timers:
+                        del channel_timers[before.channel.id]
+                except Exception as e:
+                    print(f"채널 삭제 오류: {e}")
+            else:
+                # 사용된 적이 없는 채널은 30초 타이머 시작
+                if before.channel.id not in channel_timers:
+                    task = asyncio.create_task(delete_channel_after_delay(before.channel.id))
+                    channel_timers[before.channel.id] = task
+                    print(f"30초 타이머 시작됨: {before.channel.name}")
 
 @bot.tree.command(name="패널", description="통화방 생성 패널을 현재 채널에 전송합니다. (관리자 전용)")
 async def send_panel(interaction: discord.Interaction):
@@ -176,7 +226,7 @@ async def send_panel(interaction: discord.Interaction):
         title="🎙️ 통화방 생성",
         description="**아래 버튼을 클릭하여 통화방을 생성하세요!**\n\n"
                    "🔹 **1~5인** 인원제한 통화방\n"
-                   "🔹 **사용 후 비어있으면** 자동 삭제\n"
+                   "🔹 **30초간** 비어있으면 자동 삭제\n"
                    "🔹 **무제한** 통화방 생성 가능\n\n"
                    "⚡ 버튼을 클릭하면 즉시 통화방이 생성됩니다!",
         color=0x5865f2
@@ -207,11 +257,15 @@ async def channel_list(interaction: discord.Interaction):
                 created_time = info['created_at'].strftime("%H:%M:%S")
                 member_count = len(channel.members)
                 
+                # 타이머 상태 확인
+                timer_status = "⏰ 타이머 작동중" if channel_id in channel_timers else "✅ 활성"
+                
                 embed.add_field(
                     name=f"🔊 {channel.name}",
                     value=f"생성자: {creator.display_name if creator else '알 수 없음'}\n"
                           f"현재: {member_count}/{info['limit']}명\n"
-                          f"생성: {created_time}",
+                          f"생성: {created_time}\n"
+                          f"상태: {timer_status}",
                     inline=True
                 )
             except:
@@ -276,7 +330,7 @@ async def send_panel_text(ctx):
         title="🎙️ 통화방 생성",
         description="**아래 버튼을 클릭하여 통화방을 생성하세요!**\n\n"
                    "🔹 **1~5인** 인원제한 통화방\n"
-                   "🔹 **사용 후 비어있으면** 자동 삭제\n"
+                   "🔹 **30초간** 비어있으면 자동 삭제\n"
                    "🔹 **무제한** 통화방 생성 가능\n\n"
                    "⚡ 버튼을 클릭하면 즉시 통화방이 생성됩니다!",
         color=0x5865f2
