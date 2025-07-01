@@ -5,6 +5,7 @@ import requests
 import asyncio
 from datetime import datetime
 import logging
+import random
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,9 @@ app = Flask(__name__)
 bot_status = {
     'last_ping': datetime.now(),
     'total_pings': 0,
-    'bot_ready': False
+    'bot_ready': False,
+    'last_auto_channel': datetime.now(),
+    'auto_channels_created': 0
 }
 
 @app.route('/')
@@ -29,6 +32,8 @@ def home():
     <p>마지막 핑: {bot_status['last_ping'].strftime('%Y-%m-%d %H:%M:%S')}</p>
     <p>총 핑 횟수: {bot_status['total_pings']}</p>
     <p>활성 채널: {len(created_channels) if 'created_channels' in globals() else 0}개</p>
+    <p>자동 채널 생성: {bot_status['auto_channels_created']}개</p>
+    <p>마지막 자동 채널: {bot_status['last_auto_channel'].strftime('%Y-%m-%d %H:%M:%S')}</p>
     """
 
 @app.route('/health')
@@ -37,7 +42,8 @@ def health():
         "status": "alive", 
         "timestamp": datetime.now().isoformat(),
         "bot_ready": bot_status['bot_ready'],
-        "active_channels": len(created_channels) if 'created_channels' in globals() else 0
+        "active_channels": len(created_channels) if 'created_channels' in globals() else 0,
+        "auto_channels_created": bot_status['auto_channels_created']
     }
 
 @app.route('/ping')
@@ -92,6 +98,89 @@ async def keep_alive():
         # 상태 업데이트
         bot_status['last_ping'] = datetime.now()
 
+# 자동 채널 생성으로 봇 활성 상태 유지
+async def auto_channel_keeper():
+    """10분마다 자동으로 임시 채널을 생성해서 봇을 깨워둠"""
+    await bot.wait_until_ready()
+    
+    while not bot.is_closed():
+        try:
+            # 10분 대기 (600초)
+            await asyncio.sleep(600)
+            
+            # 모든 길드를 확인
+            for guild in bot.guilds:
+                try:
+                    # 카테고리 찾기 또는 생성
+                    category = discord.utils.get(guild.categories, name="🔊 임시 통화방")
+                    if not category:
+                        category = await guild.create_category("🔊 임시 통화방")
+                    
+                    # 랜덤한 이름으로 채널 생성
+                    random_names = [
+                        "자동-대기실", "임시-방", "빈-채널", "대기-공간", 
+                        "휴식-채널", "잠깐-방", "보관-채널", "예비-통화방"
+                    ]
+                    
+                    channel_name = f"{random.choice(random_names)}-{random.randint(100, 999)}"
+                    
+                    # 음성 채널 생성
+                    voice_channel = await guild.create_voice_channel(
+                        name=channel_name,
+                        category=category,
+                        user_limit=1  # 1명만 들어갈 수 있게 (실제 사용 방지)
+                    )
+                    
+                    # 생성된 채널 추적
+                    created_channels[voice_channel.id] = {
+                        'channel': voice_channel,
+                        'creator': bot.user.id,  # 봇이 생성
+                        'created_at': datetime.now(),
+                        'limit': 1,
+                        'has_been_used': False,
+                        'auto_created': True  # 자동 생성 표시
+                    }
+                    
+                    # 5초 후 자동 삭제 (빠른 정리)
+                    asyncio.create_task(delete_auto_channel(voice_channel.id, 5))
+                    
+                    # 상태 업데이트
+                    bot_status['last_auto_channel'] = datetime.now()
+                    bot_status['auto_channels_created'] += 1
+                    
+                    logger.info(f"🤖 자동 Keep-Alive 채널 생성됨: {channel_name} in {guild.name}")
+                    
+                    # 길드당 하나만 생성
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"❌ 자동 채널 생성 오류 (길드: {guild.name}): {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"❌ 자동 채널 생성 시스템 오류: {e}")
+
+async def delete_auto_channel(channel_id, delay=5):
+    """자동 생성된 채널을 빠르게 삭제"""
+    try:
+        await asyncio.sleep(delay)
+        
+        if channel_id in created_channels and created_channels[channel_id].get('auto_created'):
+            channel = created_channels[channel_id]['channel']
+            
+            try:
+                await channel.delete()
+                logger.info(f"🗑️ 자동 생성 채널 삭제됨: {channel.name}")
+            except discord.NotFound:
+                pass  # 이미 삭제됨
+            
+            # 딕셔너리에서 제거
+            if channel_id in created_channels:
+                del created_channels[channel_id]
+                
+    except Exception as e:
+        logger.error(f"❌ 자동 채널 삭제 오류: {e}")
+
 # 웹 서버를 별도 스레드에서 실행
 web_thread = Thread(target=run_web, daemon=True)
 web_thread.start()
@@ -120,7 +209,12 @@ async def delete_channel_after_delay(channel_id, delay=30):
         await asyncio.sleep(delay)
         
         if channel_id in created_channels:
-            channel = created_channels[channel_id]['channel']
+            channel_info = created_channels[channel_id]
+            channel = channel_info['channel']
+            
+            # 자동 생성된 채널은 건드리지 않음
+            if channel_info.get('auto_created'):
+                return
             
             # 채널이 여전히 비어있는지 확인
             if len(channel.members) == 0:
@@ -208,7 +302,8 @@ class VoiceChannelView(discord.ui.View):
                 'creator': user.id,
                 'created_at': datetime.now(),
                 'limit': limit,
-                'has_been_used': False
+                'has_been_used': False,
+                'auto_created': False  # 수동 생성
             }
             
             # 사용자를 채널로 이동 (음성 채널에 있을 때만)
@@ -256,6 +351,10 @@ async def on_ready():
     asyncio.create_task(keep_alive())
     logger.info("🔄 Keep-alive 작업이 시작되었습니다.")
     
+    # 자동 채널 생성으로 봇 활성 상태 유지
+    asyncio.create_task(auto_channel_keeper())
+    logger.info("🤖 자동 채널 생성 Keep-Alive 시작되었습니다.")
+    
     try:
         synced = await bot.tree.sync()
         logger.info(f'⚡ {len(synced)}개의 슬래시 명령어가 동기화되었습니다.')
@@ -268,17 +367,32 @@ async def on_voice_state_update(member, before, after):
     
     # 사용자가 임시 통화방에 들어왔을 때
     if after.channel and after.channel.id in created_channels:
-        created_channels[after.channel.id]['has_been_used'] = True
+        channel_info = created_channels[after.channel.id]
         
-        # 기존 타이머가 있으면 취소
-        if after.channel.id in channel_timers:
-            channel_timers[after.channel.id].cancel()
-            del channel_timers[after.channel.id]
-            logger.info(f"⏹️ 채널 입장으로 타이머 취소됨: {after.channel.name}")
+        # 자동 생성된 채널은 실제 사용 방지
+        if channel_info.get('auto_created'):
+            try:
+                # 자동 생성 채널에서 사용자를 내보냄
+                await member.move_to(None)
+                logger.info(f"🚫 자동 생성 채널에서 사용자 추방: {member.display_name}")
+            except:
+                pass
+        else:
+            created_channels[after.channel.id]['has_been_used'] = True
+            
+            # 기존 타이머가 있으면 취소
+            if after.channel.id in channel_timers:
+                channel_timers[after.channel.id].cancel()
+                del channel_timers[after.channel.id]
+                logger.info(f"⏹️ 채널 입장으로 타이머 취소됨: {after.channel.name}")
     
     # 사용자가 임시 통화방을 떠났을 때
     if before.channel and before.channel.id in created_channels:
         channel_info = created_channels[before.channel.id]
+        
+        # 자동 생성된 채널은 건드리지 않음
+        if channel_info.get('auto_created'):
+            return
         
         # 채널이 완전히 비었는지 확인
         if len(before.channel.members) == 0:
@@ -349,7 +463,13 @@ async def channel_list(interaction: discord.Interaction):
             color=0x00ff99
         )
         
+        user_channels = []  # 실제 사용자 채널만
+        
         for channel_id, info in created_channels.items():
+            # 자동 생성된 채널은 목록에서 제외
+            if info.get('auto_created'):
+                continue
+                
             try:
                 channel = info['channel']
                 creator = bot.get_user(info['creator'])
@@ -367,8 +487,12 @@ async def channel_list(interaction: discord.Interaction):
                           f"상태: {timer_status}",
                     inline=True
                 )
+                user_channels.append(info)
             except:
                 continue
+        
+        if not user_channels:
+            embed.description = "현재 생성된 사용자 통화방이 없습니다."
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -376,7 +500,7 @@ async def channel_list(interaction: discord.Interaction):
 async def delete_my_channel(interaction: discord.Interaction):
     user_channels = [
         info for info in created_channels.values() 
-        if info['creator'] == interaction.user.id
+        if info['creator'] == interaction.user.id and not info.get('auto_created')
     ]
     
     if not user_channels:
@@ -421,13 +545,19 @@ async def delete_my_channel(interaction: discord.Interaction):
 
 @bot.tree.command(name="상태", description="봇 상태를 확인합니다.")
 async def bot_status_cmd(interaction: discord.Interaction):
+    user_channels = len([ch for ch in created_channels.values() if not ch.get('auto_created')])
+    auto_channels = len([ch for ch in created_channels.values() if ch.get('auto_created')])
+    
     embed = discord.Embed(
         title="🤖 봇 상태",
         description=f"봇이 정상적으로 작동 중입니다!\n"
                    f"현재 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                   f"활성 채널: {len(created_channels)}개\n"
+                   f"사용자 채널: {user_channels}개\n"
+                   f"자동 채널: {auto_channels}개\n"
                    f"마지막 핑: {bot_status['last_ping'].strftime('%H:%M:%S')}\n"
-                   f"총 핑 횟수: {bot_status['total_pings']}회",
+                   f"총 핑 횟수: {bot_status['total_pings']}회\n"
+                   f"자동 채널 생성: {bot_status['auto_channels_created']}개\n"
+                   f"마지막 자동 채널: {bot_status['last_auto_channel'].strftime('%H:%M:%S')}",
         color=0x00ff99
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
