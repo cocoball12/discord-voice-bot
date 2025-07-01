@@ -101,12 +101,16 @@ class VoiceChannelView(discord.ui.View):
                 category = await guild.create_category("🔊 임시 통화방")
             
             # 채널 이름 생성 - 생성자 이름 제거하고 단순하게
-            channel_name = f"{limit}인방"
+            base_name = f"{limit}인방"
+            channel_name = base_name
             
             # 동일한 이름의 채널이 있는지 확인하고 번호 추가
-            existing_channels = [ch for ch in guild.voice_channels if ch.name.startswith(channel_name)]
-            if existing_channels:
-                channel_name = f"{limit}인방 #{len(existing_channels) + 1}"
+            existing_names = [ch.name for ch in guild.voice_channels if ch.category == category]
+            counter = 1
+            
+            while channel_name in existing_names:
+                counter += 1
+                channel_name = f"{base_name} #{counter}"
             
             # 음성 채널 생성
             voice_channel = await guild.create_voice_channel(
