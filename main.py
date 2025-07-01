@@ -4,41 +4,100 @@ import os
 import requests
 import asyncio
 from datetime import datetime
+import logging
 
-# 웹 서버 (Render용)
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 웹 서버 (Render용) - 더 안정적으로 개선
 app = Flask(__name__)
+
+# 봇 상태 추적용 전역 변수
+bot_status = {
+    'last_ping': datetime.now(),
+    'total_pings': 0,
+    'bot_ready': False
+}
 
 @app.route('/')
 def home():
-    return f"Discord Bot is online! Last ping: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    status = "🟢 온라인" if bot_status['bot_ready'] else "🟡 시작중"
+    return f"""
+    <h1>Discord Bot Status</h1>
+    <p>상태: {status}</p>
+    <p>마지막 핑: {bot_status['last_ping'].strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <p>총 핑 횟수: {bot_status['total_pings']}</p>
+    <p>활성 채널: {len(created_channels) if 'created_channels' in globals() else 0}개</p>
+    """
 
 @app.route('/health')
 def health():
-    return {"status": "alive", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "alive", 
+        "timestamp": datetime.now().isoformat(),
+        "bot_ready": bot_status['bot_ready'],
+        "active_channels": len(created_channels) if 'created_channels' in globals() else 0
+    }
+
+@app.route('/ping')
+def ping():
+    bot_status['last_ping'] = datetime.now()
+    bot_status['total_pings'] += 1
+    return {"pong": True, "timestamp": datetime.now().isoformat()}
 
 def run_web():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)), debug=False)
 
-# Keep-Alive 함수
+# 개선된 Keep-Alive 함수
 async def keep_alive():
-    """5분마다 자신의 웹서버에 ping을 보내서 sleep 방지"""
+    """더 안정적인 keep-alive 시스템"""
+    consecutive_failures = 0
+    max_failures = 3
+    
     while True:
         try:
-            # 5분 대기
-            await asyncio.sleep(300)  # 300초 = 5분
+            # 3분마다 ping (5분보다 짧게)
+            await asyncio.sleep(180)  # 180초 = 3분
             
-            # 자신의 서버에 ping (Render URL로 변경 필요)
-            url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')
-            if url != 'http://localhost:10000':
-                response = requests.get(f"{url}/health", timeout=10)
-                print(f"Keep-alive ping sent: {response.status_code} at {datetime.now()}")
+            # 환경변수에서 URL 가져오기
+            url = os.environ.get('RENDER_EXTERNAL_URL')
+            
+            if url:
+                # 자신의 서버에 ping
+                response = requests.get(f"{url}/ping", timeout=30)
+                
+                if response.status_code == 200:
+                    consecutive_failures = 0
+                    logger.info(f"✅ Keep-alive 성공: {response.status_code} at {datetime.now()}")
+                else:
+                    consecutive_failures += 1
+                    logger.warning(f"⚠️ Keep-alive 응답 이상: {response.status_code}")
+            else:
+                logger.info("🔄 RENDER_EXTERNAL_URL 미설정, 로컬 모드")
+                
+        except requests.exceptions.RequestException as e:
+            consecutive_failures += 1
+            logger.error(f"❌ Keep-alive 네트워크 오류: {e}")
+            
         except Exception as e:
-            print(f"Keep-alive error: {e}")
+            consecutive_failures += 1
+            logger.error(f"❌ Keep-alive 예상치 못한 오류: {e}")
+        
+        # 연속 실패가 많으면 더 자주 시도
+        if consecutive_failures >= max_failures:
+            logger.error(f"🚨 Keep-alive {consecutive_failures}회 연속 실패, 1분 후 재시도")
+            await asyncio.sleep(60)  # 1분 후 재시도
+        
+        # 상태 업데이트
+        bot_status['last_ping'] = datetime.now()
 
 # 웹 서버를 별도 스레드에서 실행
-Thread(target=run_web, daemon=True).start()
+web_thread = Thread(target=run_web, daemon=True)
+web_thread.start()
+logger.info("🌐 웹 서버 시작됨")
 
-# 여기 아래에 기존 봇 코드...
+# Discord 봇 부분
 import discord
 from discord.ext import commands, tasks
 from datetime import timedelta
@@ -57,16 +116,16 @@ channel_timers = {}
 
 async def delete_channel_after_delay(channel_id, delay=30):
     """지정된 시간 후 채널 삭제"""
-    await asyncio.sleep(delay)
-    
-    if channel_id in created_channels:
-        try:
+    try:
+        await asyncio.sleep(delay)
+        
+        if channel_id in created_channels:
             channel = created_channels[channel_id]['channel']
             
             # 채널이 여전히 비어있는지 확인
             if len(channel.members) == 0:
                 await channel.delete()
-                print(f"30초 타이머로 채널 삭제됨: {channel.name}")
+                logger.info(f"⏰ 30초 타이머로 채널 삭제됨: {channel.name}")
                 
                 # 딕셔너리에서 제거
                 if channel_id in created_channels:
@@ -78,14 +137,14 @@ async def delete_channel_after_delay(channel_id, delay=30):
                 if channel_id in channel_timers:
                     del channel_timers[channel_id]
                     
-        except discord.NotFound:
-            # 채널이 이미 삭제된 경우
-            if channel_id in created_channels:
-                del created_channels[channel_id]
-            if channel_id in channel_timers:
-                del channel_timers[channel_id]
-        except Exception as e:
-            print(f"타이머 채널 삭제 오류: {e}")
+    except discord.NotFound:
+        # 채널이 이미 삭제된 경우
+        if channel_id in created_channels:
+            del created_channels[channel_id]
+        if channel_id in channel_timers:
+            del channel_timers[channel_id]
+    except Exception as e:
+        logger.error(f"❌ 타이머 채널 삭제 오류: {e}")
 
 class VoiceChannelView(discord.ui.View):
     def __init__(self):
@@ -121,7 +180,7 @@ class VoiceChannelView(discord.ui.View):
             if not category:
                 category = await guild.create_category("🔊 임시 통화방")
             
-            # 채널 이름 생성 - 생성자 이름 제거하고 단순하게
+            # 채널 이름 생성
             base_name = f"{limit}인방"
             channel_name = base_name
             
@@ -174,6 +233,7 @@ class VoiceChannelView(discord.ui.View):
             )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
+            logger.info(f"✅ 채널 생성됨: {channel_name} by {user.display_name}")
             
         except Exception as e:
             error_embed = discord.Embed(
@@ -182,22 +242,25 @@ class VoiceChannelView(discord.ui.View):
                 color=0xff0000
             )
             await interaction.response.send_message(embed=error_embed, ephemeral=True)
-            print(f"채널 생성 오류: {e}")
+            logger.error(f"❌ 채널 생성 오류: {e}")
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user}가 로그인했습니다!')
+    logger.info(f'🤖 {bot.user}가 로그인했습니다!')
     bot.add_view(VoiceChannelView())
+    
+    # 봇 상태 업데이트
+    bot_status['bot_ready'] = True
     
     # Keep-alive 작업 시작
     asyncio.create_task(keep_alive())
-    print("Keep-alive 작업이 시작되었습니다.")
+    logger.info("🔄 Keep-alive 작업이 시작되었습니다.")
     
     try:
         synced = await bot.tree.sync()
-        print(f'{len(synced)}개의 슬래시 명령어가 동기화되었습니다.')
+        logger.info(f'⚡ {len(synced)}개의 슬래시 명령어가 동기화되었습니다.')
     except Exception as e:
-        print(f'명령어 동기화 실패: {e}')
+        logger.error(f'❌ 명령어 동기화 실패: {e}')
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -211,7 +274,7 @@ async def on_voice_state_update(member, before, after):
         if after.channel.id in channel_timers:
             channel_timers[after.channel.id].cancel()
             del channel_timers[after.channel.id]
-            print(f"채널 입장으로 타이머 취소됨: {after.channel.name}")
+            logger.info(f"⏹️ 채널 입장으로 타이머 취소됨: {after.channel.name}")
     
     # 사용자가 임시 통화방을 떠났을 때
     if before.channel and before.channel.id in created_channels:
@@ -230,7 +293,7 @@ async def on_voice_state_update(member, before, after):
                         channel_timers[before.channel.id].cancel()
                         del channel_timers[before.channel.id]
                     
-                    print(f"사용 후 빈 채널 즉시 삭제됨: {before.channel.name}")
+                    logger.info(f"🗑️ 사용 후 빈 채널 즉시 삭제됨: {before.channel.name}")
                     
                 except discord.NotFound:
                     if before.channel.id in created_channels:
@@ -238,14 +301,15 @@ async def on_voice_state_update(member, before, after):
                     if before.channel.id in channel_timers:
                         del channel_timers[before.channel.id]
                 except Exception as e:
-                    print(f"채널 삭제 오류: {e}")
+                    logger.error(f"❌ 채널 삭제 오류: {e}")
             else:
                 # 사용된 적이 없는 채널은 30초 타이머 시작
                 if before.channel.id not in channel_timers:
                     task = asyncio.create_task(delete_channel_after_delay(before.channel.id))
                     channel_timers[before.channel.id] = task
-                    print(f"30초 타이머 시작됨: {before.channel.name}")
+                    logger.info(f"⏰ 30초 타이머 시작됨: {before.channel.name}")
 
+# 슬래시 명령어들
 @bot.tree.command(name="패널", description="통화방 생성 패널을 현재 채널에 전송합니다. (관리자 전용)")
 async def send_panel(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -356,12 +420,14 @@ async def delete_my_channel(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="상태", description="봇 상태를 확인합니다.")
-async def bot_status(interaction: discord.Interaction):
+async def bot_status_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🤖 봇 상태",
         description=f"봇이 정상적으로 작동 중입니다!\n"
                    f"현재 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                   f"활성 채널: {len(created_channels)}개",
+                   f"활성 채널: {len(created_channels)}개\n"
+                   f"마지막 핑: {bot_status['last_ping'].strftime('%H:%M:%S')}\n"
+                   f"총 핑 횟수: {bot_status['total_pings']}회",
         color=0x00ff99
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -391,16 +457,16 @@ async def send_panel_text(ctx):
     except:
         pass
 
-# 봇 실행 - 환경변수에서 토큰 가져오기
+# 봇 실행
 if __name__ == "__main__":
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     
     if not TOKEN:
-        print("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다!")
-        print("호스팅 서비스에서 환경변수를 설정해주세요.")
+        logger.error("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다!")
+        logger.error("호스팅 서비스에서 환경변수를 설정해주세요.")
     else:
-        print("🚀 봇을 시작합니다...")
+        logger.info("🚀 봇을 시작합니다...")
         try:
-            bot.run(TOKEN)
+            bot.run(TOKEN, log_handler=None)  # 로깅 중복 방지
         except Exception as e:
-            print(f"봇 실행 오류: {e}")
+            logger.error(f"❌ 봇 실행 오류: {e}")
