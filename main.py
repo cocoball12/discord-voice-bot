@@ -1,3 +1,21 @@
+from flask import Flask
+from threading import Thread
+import os
+
+# 웹 서버 (Render용)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Discord Bot is online!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+# 웹 서버를 별도 스레드에서 실행
+Thread(target=run_web).start()
+
+# 여기 아래에 기존 봇 코드...
 import discord
 from discord.ext import commands, tasks
 import asyncio
