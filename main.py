@@ -1,26 +1,47 @@
 from flask import Flask
 from threading import Thread
 import os
+import requests
+import asyncio
+from datetime import datetime
 
 # 웹 서버 (Render용)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Discord Bot is online!"
+    return f"Discord Bot is online! Last ping: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+@app.route('/health')
+def health():
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
 def run_web():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
+# Keep-Alive 함수
+async def keep_alive():
+    """5분마다 자신의 웹서버에 ping을 보내서 sleep 방지"""
+    while True:
+        try:
+            # 5분 대기
+            await asyncio.sleep(300)  # 300초 = 5분
+            
+            # 자신의 서버에 ping (Render URL로 변경 필요)
+            url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')
+            if url != 'http://localhost:10000':
+                response = requests.get(f"{url}/health", timeout=10)
+                print(f"Keep-alive ping sent: {response.status_code} at {datetime.now()}")
+        except Exception as e:
+            print(f"Keep-alive error: {e}")
+
 # 웹 서버를 별도 스레드에서 실행
-Thread(target=run_web).start()
+Thread(target=run_web, daemon=True).start()
 
 # 여기 아래에 기존 봇 코드...
 import discord
 from discord.ext import commands, tasks
-import asyncio
-from datetime import datetime, timedelta
-import os
+from datetime import timedelta
 
 # 봇 설정
 intents = discord.Intents.default()
@@ -167,6 +188,10 @@ class VoiceChannelView(discord.ui.View):
 async def on_ready():
     print(f'{bot.user}가 로그인했습니다!')
     bot.add_view(VoiceChannelView())
+    
+    # Keep-alive 작업 시작
+    asyncio.create_task(keep_alive())
+    print("Keep-alive 작업이 시작되었습니다.")
     
     try:
         synced = await bot.tree.sync()
@@ -330,6 +355,17 @@ async def delete_my_channel(interaction: discord.Interaction):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="상태", description="봇 상태를 확인합니다.")
+async def bot_status(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤖 봇 상태",
+        description=f"봇이 정상적으로 작동 중입니다!\n"
+                   f"현재 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                   f"활성 채널: {len(created_channels)}개",
+        color=0x00ff99
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.command(name="패널")
 async def send_panel_text(ctx):
     if not ctx.author.guild_permissions.administrator:
@@ -364,4 +400,7 @@ if __name__ == "__main__":
         print("호스팅 서비스에서 환경변수를 설정해주세요.")
     else:
         print("🚀 봇을 시작합니다...")
-        bot.run(TOKEN)
+        try:
+            bot.run(TOKEN)
+        except Exception as e:
+            print(f"봇 실행 오류: {e}")
